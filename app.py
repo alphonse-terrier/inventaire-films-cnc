@@ -31,6 +31,22 @@ def strip_accents(s: str) -> str:
     )
 
 
+def fmt_director(raw: str) -> str:
+    """Convert 'Nom, Prénom ; Nom2, Prénom2' → 'Prénom Nom ; Prénom2 Nom2'.
+    Handles particles (de, du, von…) and entries without comma unchanged."""
+    parts = [p.strip() for p in raw.split(";")]
+    result = []
+    for part in parts:
+        if "," in part:
+            nom, _, prenom = part.partition(",")
+            prenom = prenom.strip()
+            nom = nom.strip()
+            result.append(f"{prenom} {nom}".strip() if prenom else nom)
+        else:
+            result.append(part)
+    return " ; ".join(result)
+
+
 # ── Data loading ──────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner="Chargement de l'inventaire…")
 def load_data() -> pd.DataFrame:
@@ -74,12 +90,13 @@ def get_all_countries(data: pd.DataFrame) -> list[str]:
 
 @st.cache_data(show_spinner=False)
 def get_all_directors(data: pd.DataFrame) -> list[str]:
+    """Return directors as 'Prénom Nom', sorted."""
     directors: set[str] = set()
     for val in data["Réalisateur(s)"].dropna():
         for d in str(val).split(";"):
             d = d.strip()
             if d:
-                directors.add(d)
+                directors.add(fmt_director(d))
     return sorted(directors)
 
 
@@ -327,6 +344,12 @@ DISPLAY_COLS = [
 def render_table(filtered: pd.DataFrame, filters: dict):
     cols = [c for c in DISPLAY_COLS if c in filtered.columns]
     display = filtered[cols].copy()
+
+    # Format director names as "Prénom Nom"
+    if "Réalisateur(s)" in display.columns:
+        display["Réalisateur(s)"] = display["Réalisateur(s)"].fillna("").astype(str).apply(
+            lambda v: fmt_director(v) if v else ""
+        )
 
     for col in ["LTC", "CT", "CNC", "Netgem - Eclair Préservation"]:
         if col in display.columns:
