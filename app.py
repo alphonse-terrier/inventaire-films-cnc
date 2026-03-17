@@ -151,44 +151,32 @@ def highlight_tokens(text: str, query: str) -> str:
 def render_sidebar(data: pd.DataFrame) -> dict:
     st.sidebar.title("🔍 Filtres")
 
-    # ── Global search ──────────────────────────────────────────────────────
-    st.sidebar.subheader("Recherche globale")
-    global_q = st.sidebar.text_input(
-        "Titre ou réalisateur",
-        placeholder="ex. nouvelle vague godard",
-        help="Recherche simultanée dans le titre ET le réalisateur. "
-             "Plusieurs mots = tous doivent être présents (AND).",
+    # ── Texte ──────────────────────────────────────────────────────────────
+    titre_q = st.sidebar.text_input(
+        "Titre",
+        placeholder="ex. nuit américaine",
+        help="Multi-mots = AND. Insensible aux accents.",
     )
-
-    st.sidebar.subheader("Recherche par champ")
-    col1, col2 = st.sidebar.columns(2)
-    titre_q = col1.text_input("Titre", placeholder="ex. Breathless")
-    real_q = col2.text_input("Réalisateur", placeholder="ex. Truffaut")
-
-    # Mode
     search_mode = st.sidebar.radio(
-        "Mode de correspondance",
+        "Mode",
         ["Contient", "Commence par", "Exact"],
         horizontal=True,
-        help="S'applique aux trois champs texte ci-dessus.",
     )
 
-    # Director autocomplete
-    st.sidebar.subheader("Réalisateur — autocomplétion")
     all_directors = get_all_directors(data)
     director_pick = st.sidebar.selectbox(
-        "Choisir un réalisateur",
+        "Réalisateur",
         options=[""] + all_directors,
         index=0,
-        placeholder="Parcourir la liste…",
+        placeholder="Tous les réalisateurs…",
     )
 
-    # Year range
+    # ── Période ────────────────────────────────────────────────────────────
+    st.sidebar.divider()
     year_min = int(data["Année"].min(skipna=True))
     year_max = int(data["Année"].max(skipna=True))
-    st.sidebar.subheader("Période")
     year_range = st.sidebar.slider(
-        "Année de production",
+        "Période",
         min_value=year_min,
         max_value=year_max,
         value=(1950, year_max),
@@ -196,26 +184,26 @@ def render_sidebar(data: pd.DataFrame) -> dict:
     )
     include_no_year = st.sidebar.checkbox("Inclure les films sans année", value=True)
 
-    # Countries
-    st.sidebar.subheader("Pays")
+    # ── Pays ───────────────────────────────────────────────────────────────
+    st.sidebar.divider()
     all_countries = get_all_countries(data)
     selected_countries = st.sidebar.multiselect(
-        "Pays (co-productions incluses)",
+        "Pays",
         options=all_countries,
-        placeholder="Tous les pays",
+        placeholder="Tous les pays…",
+        help="Co-productions incluses.",
     )
 
-    # Flags
-    st.sidebar.subheader("Collections / Préservation")
+    # ── Collections ────────────────────────────────────────────────────────
+    st.sidebar.divider()
+    st.sidebar.caption("Collections / Préservation")
     flag_filters: dict[str, bool] = {}
     for label, col in FLAG_COLS.items():
         if col in data.columns:
             flag_filters[col] = st.sidebar.checkbox(label)
 
     return {
-        "global_q": global_q,
         "titre": titre_q,
-        "realisateur": real_q,
         "director_pick": director_pick,
         "search_mode": search_mode,
         "year_range": year_range,
@@ -230,24 +218,11 @@ def apply_filters(data: pd.DataFrame, filters: dict) -> pd.DataFrame:
     mask = pd.Series(True, index=data.index)
     mode = filters["search_mode"]
 
-    # Global search: titre OR réalisateur must match all tokens
-    if filters["global_q"].strip():
-        tokens = _tokens(filters["global_q"])
-        global_mask = pd.Series(True, index=data.index)
-        for t in tokens:
-            token_mask = data["_titre_norm"].str.contains(re.escape(t)) | \
-                         data["_real_norm"].str.contains(re.escape(t))
-            global_mask &= token_mask
-        mask &= global_mask
-
-    # Per-field text filters
     if filters["titre"].strip():
         mask &= text_mask(data["_titre_norm"], filters["titre"], mode)
 
-    # Director: typed field OR autocomplete pick (pick takes precedence if set)
-    real_q = filters["director_pick"] if filters["director_pick"] else filters["realisateur"]
-    if real_q.strip():
-        mask &= text_mask(data["_real_norm"], real_q, mode)
+    if filters["director_pick"]:
+        mask &= text_mask(data["_real_norm"], filters["director_pick"], "Contient")
 
     # Year range
     year_mask = data["Année"].between(*filters["year_range"])
@@ -273,18 +248,15 @@ def apply_filters(data: pd.DataFrame, filters: dict) -> pd.DataFrame:
 # ── Active filter badges ──────────────────────────────────────────────────────
 def active_filter_summary(filters: dict) -> str:
     badges = []
-    if filters["global_q"]:
-        badges.append(f'🔎 `{filters["global_q"]}`')
     if filters["titre"]:
-        badges.append(f'Titre : `{filters["titre"]}`')
-    real_q = filters["director_pick"] or filters["realisateur"]
-    if real_q:
-        badges.append(f'Réalisateur : `{real_q}`')
+        badges.append(f'Titre : `{filters["titre"]}` ({filters["search_mode"].lower()})')
+    if filters["director_pick"]:
+        badges.append(f'Réalisateur : `{filters["director_pick"]}`')
     if filters["countries"]:
         badges.append("Pays : " + ", ".join(f"`{c}`" for c in filters["countries"]))
     active_flags = [lbl for lbl, col in FLAG_COLS.items() if filters["flags"].get(col)]
     if active_flags:
-        badges.append("Flags : " + " · ".join(active_flags))
+        badges.append(" · ".join(active_flags))
     return "  |  ".join(badges) if badges else ""
 
 
@@ -356,16 +328,10 @@ def render_table(filtered: pd.DataFrame, filters: dict):
             display[col] = display[col].map({True: "✓", False: ""})
     display["Année"] = display["Année"].astype("object").where(display["Année"].notna(), other="")
 
-    # Highlight search terms in Titre and Réalisateur(s) columns
-    search_q = filters["global_q"] or filters["titre"]
-    real_q = filters["director_pick"] or filters["realisateur"]
-    if search_q:
+    # Highlight search terms in Titre column
+    if filters["titre"]:
         display["Titre"] = display["Titre"].fillna("").apply(
-            lambda t: highlight_tokens(t, search_q)
-        )
-    if real_q and not filters["director_pick"]:  # don't mangle exact picks
-        display["Réalisateur(s)"] = display["Réalisateur(s)"].fillna("").apply(
-            lambda t: highlight_tokens(t, real_q)
+            lambda t: highlight_tokens(t, filters["titre"])
         )
 
     st.dataframe(
