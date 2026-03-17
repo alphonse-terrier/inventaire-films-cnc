@@ -24,7 +24,6 @@ FLAG_COLS = {
 
 # ── Text normalization ────────────────────────────────────────────────────────
 def strip_accents(s: str) -> str:
-    """Lowercase + remove diacritics: 'Éléphant' → 'elephant'."""
     return "".join(
         c for c in unicodedata.normalize("NFD", s.lower())
         if unicodedata.category(c) != "Mn"
@@ -32,15 +31,13 @@ def strip_accents(s: str) -> str:
 
 
 def fmt_director(raw: str) -> str:
-    """Convert 'Nom, Prénom ; Nom2, Prénom2' → 'Prénom Nom ; Prénom2 Nom2'.
-    Handles particles (de, du, von…) and entries without comma unchanged."""
+    """'Nom, Prénom ; Nom2, Prénom2' → 'Prénom Nom ; Prénom2 Nom2'."""
     parts = [p.strip() for p in raw.split(";")]
     result = []
     for part in parts:
         if "," in part:
             nom, _, prenom = part.partition(",")
-            prenom = prenom.strip()
-            nom = nom.strip()
+            prenom, nom = prenom.strip(), nom.strip()
             result.append(f"{prenom} {nom}".strip() if prenom else nom)
         else:
             result.append(part)
@@ -51,8 +48,7 @@ def fmt_director(raw: str) -> str:
 @st.cache_data(show_spinner="Chargement de l'inventaire…")
 def load_data() -> pd.DataFrame:
     xl = pd.ExcelFile(EXCEL_PATH)
-    frames = [xl.parse(sheet) for sheet in xl.sheet_names]
-    data = pd.concat(frames, ignore_index=True)
+    data = pd.concat([xl.parse(s) for s in xl.sheet_names], ignore_index=True)
 
     data["Année"] = pd.to_numeric(data["Année"], errors="coerce").astype("Int64")
 
@@ -63,16 +59,13 @@ def load_data() -> pd.DataFrame:
     if "Pays" in data.columns:
         data["Pays"] = (
             data["Pays"]
-            .fillna("")
-            .astype(str)
+            .fillna("").astype(str)
             .str.replace(r"\s*;\s*", " ; ", regex=True)
             .str.replace(r"([a-zéèêëàâùûî])([A-ZÉÈÀÂ])", r"\1 ; \2", regex=True)
         )
 
-    # Pre-compute normalised search columns (no accents, lower-case)
     data["_titre_norm"] = data["Titre"].fillna("").astype(str).apply(strip_accents)
     data["_real_norm"] = data["Réalisateur(s)"].fillna("").astype(str).apply(strip_accents)
-    data["_pays_norm"] = data["Pays"].fillna("").astype(str).apply(strip_accents)
 
     return data
 
@@ -90,7 +83,6 @@ def get_all_countries(data: pd.DataFrame) -> list[str]:
 
 @st.cache_data(show_spinner=False)
 def get_all_directors(data: pd.DataFrame) -> list[str]:
-    """Return directors as 'Prénom Nom', sorted."""
     directors: set[str] = set()
     for val in data["Réalisateur(s)"].dropna():
         for d in str(val).split(";"):
@@ -102,87 +94,85 @@ def get_all_directors(data: pd.DataFrame) -> list[str]:
 
 # ── Search logic ──────────────────────────────────────────────────────────────
 def _tokens(q: str) -> list[str]:
-    """Split query into normalised tokens, ignoring empty strings."""
     return [t for t in strip_accents(q).split() if t]
 
 
 def text_mask(series_norm: pd.Series, query: str, mode: str) -> pd.Series:
-    """Return boolean mask for one text column given query and mode."""
     if not query.strip():
         return pd.Series(True, index=series_norm.index)
-
     tokens = _tokens(query)
     if not tokens:
         return pd.Series(True, index=series_norm.index)
 
     if mode == "Exact":
-        q_norm = strip_accents(query.strip())
-        return series_norm == q_norm
+        return series_norm == strip_accents(query.strip())
 
     if mode == "Commence par":
-        # All tokens must appear at the start of some word in the string
         mask = pd.Series(True, index=series_norm.index)
         for t in tokens:
             mask &= series_norm.str.contains(r"(?<![a-z])" + re.escape(t), regex=True)
         return mask
 
-    # Default: "Contient" — all tokens must appear somewhere (AND logic)
+    # Contient — all tokens must appear (AND)
     mask = pd.Series(True, index=series_norm.index)
     for t in tokens:
         mask &= series_norm.str.contains(re.escape(t), regex=True)
     return mask
 
 
-def highlight_tokens(text: str, query: str) -> str:
-    """Wrap matched tokens in ** for markdown bold."""
-    if not query:
-        return text
-    for t in _tokens(query):
-        text = re.sub(
-            f"({re.escape(t)})",
-            r"**\1**",
-            text,
-            flags=re.IGNORECASE,
-        )
-    return text
+# ── Reset ─────────────────────────────────────────────────────────────────────
+def reset_filters():
+    for key in ["f_titre", "f_directors", "f_mode", "f_years", "f_no_year", "f_countries",
+                *[f"f_flag_{col}" for col in FLAG_COLS.values()]]:
+        st.session_state.pop(key, None)
 
 
-# ── Sidebar filters ───────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 def render_sidebar(data: pd.DataFrame) -> dict:
     st.sidebar.title("🔍 Filtres")
+    st.sidebar.button("↺ Réinitialiser tous les filtres", on_click=reset_filters, use_container_width=True)
 
-    # ── Texte ──────────────────────────────────────────────────────────────
+    year_min = int(data["Année"].min(skipna=True))
+    year_max = int(data["Année"].max(skipna=True))
+
+    # ── Titre ──────────────────────────────────────────────────────────────
+    st.sidebar.divider()
     titre_q = st.sidebar.text_input(
         "Titre",
         placeholder="ex. nuit américaine",
-        help="Multi-mots = AND. Insensible aux accents.",
+        help="Plusieurs mots = tous doivent être présents. Insensible aux accents.",
+        key="f_titre",
     )
     search_mode = st.sidebar.radio(
-        "Mode",
+        "Mode de correspondance (titre)",
         ["Contient", "Commence par", "Exact"],
         horizontal=True,
+        key="f_mode",
     )
 
+    # ── Réalisateur ────────────────────────────────────────────────────────
+    st.sidebar.divider()
     all_directors = get_all_directors(data)
-    director_pick = st.sidebar.selectbox(
+    director_picks = st.sidebar.multiselect(
         "Réalisateur",
-        options=[""] + all_directors,
-        index=0,
+        options=all_directors,
         placeholder="Tous les réalisateurs…",
+        key="f_directors",
     )
 
     # ── Période ────────────────────────────────────────────────────────────
     st.sidebar.divider()
-    year_min = int(data["Année"].min(skipna=True))
-    year_max = int(data["Année"].max(skipna=True))
     year_range = st.sidebar.slider(
         "Période",
         min_value=year_min,
         max_value=year_max,
-        value=(1950, year_max),
+        value=(year_min, year_max),
         step=1,
+        key="f_years",
     )
-    include_no_year = st.sidebar.checkbox("Inclure les films sans année", value=True)
+    include_no_year = st.sidebar.checkbox(
+        "Inclure les films sans année", value=True, key="f_no_year"
+    )
 
     # ── Pays ───────────────────────────────────────────────────────────────
     st.sidebar.divider()
@@ -191,7 +181,8 @@ def render_sidebar(data: pd.DataFrame) -> dict:
         "Pays",
         options=all_countries,
         placeholder="Tous les pays…",
-        help="Co-productions incluses.",
+        help="Co-productions incluses : sélectionner un pays retourne tous les films où il apparaît.",
+        key="f_countries",
     )
 
     # ── Collections ────────────────────────────────────────────────────────
@@ -200,20 +191,22 @@ def render_sidebar(data: pd.DataFrame) -> dict:
     flag_filters: dict[str, bool] = {}
     for label, col in FLAG_COLS.items():
         if col in data.columns:
-            flag_filters[col] = st.sidebar.checkbox(label)
+            flag_filters[col] = st.sidebar.checkbox(label, key=f"f_flag_{col}")
 
     return {
         "titre": titre_q,
-        "director_pick": director_pick,
+        "directors": director_picks,
         "search_mode": search_mode,
         "year_range": year_range,
+        "year_min": year_min,
+        "year_max": year_max,
         "include_no_year": include_no_year,
         "countries": selected_countries,
         "flags": flag_filters,
     }
 
 
-# ── Filtering logic ───────────────────────────────────────────────────────────
+# ── Filtering ─────────────────────────────────────────────────────────────────
 def apply_filters(data: pd.DataFrame, filters: dict) -> pd.DataFrame:
     mask = pd.Series(True, index=data.index)
     mode = filters["search_mode"]
@@ -221,23 +214,23 @@ def apply_filters(data: pd.DataFrame, filters: dict) -> pd.DataFrame:
     if filters["titre"].strip():
         mask &= text_mask(data["_titre_norm"], filters["titre"], mode)
 
-    if filters["director_pick"]:
-        mask &= text_mask(data["_real_norm"], filters["director_pick"], "Contient")
+    if filters["directors"]:
+        dir_mask = pd.Series(False, index=data.index)
+        for d in filters["directors"]:
+            dir_mask |= text_mask(data["_real_norm"], d, "Contient")
+        mask &= dir_mask
 
-    # Year range
     year_mask = data["Année"].between(*filters["year_range"])
     if filters["include_no_year"]:
         year_mask |= data["Année"].isna()
     mask &= year_mask
 
-    # Countries
     if filters["countries"]:
         selected = set(filters["countries"])
         mask &= data["Pays"].apply(
             lambda v: bool({p.strip() for p in v.split(" ; ")} & selected)
         )
 
-    # Flags
     for col, active in filters["flags"].items():
         if active:
             mask &= data[col]
@@ -245,13 +238,18 @@ def apply_filters(data: pd.DataFrame, filters: dict) -> pd.DataFrame:
     return data[mask]
 
 
-# ── Active filter badges ──────────────────────────────────────────────────────
+# ── Active filter summary ─────────────────────────────────────────────────────
 def active_filter_summary(filters: dict) -> str:
     badges = []
     if filters["titre"]:
         badges.append(f'Titre : `{filters["titre"]}` ({filters["search_mode"].lower()})')
-    if filters["director_pick"]:
-        badges.append(f'Réalisateur : `{filters["director_pick"]}`')
+    if filters["directors"]:
+        badges.append("Réalisateur : " + ", ".join(f"`{d}`" for d in filters["directors"]))
+    yr_min, yr_max = filters["year_range"]
+    if yr_min != filters["year_min"] or yr_max != filters["year_max"]:
+        badges.append(f"Période : `{yr_min} – {yr_max}`")
+    if not filters["include_no_year"]:
+        badges.append("sans année exclus")
     if filters["countries"]:
         badges.append("Pays : " + ", ".join(f"`{c}`" for c in filters["countries"]))
     active_flags = [lbl for lbl, col in FLAG_COLS.items() if filters["flags"].get(col)]
@@ -263,7 +261,10 @@ def active_filter_summary(filters: dict) -> str:
 # ── Stats ─────────────────────────────────────────────────────────────────────
 def render_stats(filtered: pd.DataFrame, total: int):
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Films trouvés", f"{len(filtered):,}", delta=f"{len(filtered) - total:,}" if len(filtered) != total else None)
+
+    pct = f"{len(filtered) / total * 100:.0f} % du catalogue" if len(filtered) != total else "catalogue complet"
+    c1.metric("Films trouvés", f"{len(filtered):,}", delta=pct, delta_color="off")
+
     with_year = filtered["Année"].dropna()
     c2.metric("Année médiane", int(with_year.median()) if len(with_year) else "—")
     c3.metric("LTC", f"{filtered['LTC'].sum():,}" if "LTC" in filtered.columns else "—")
@@ -281,13 +282,17 @@ def render_charts(filtered: pd.DataFrame):
 
         with c1:
             st.markdown("**Films par décennie**")
-            decade_data = (
-                filtered["Année"].dropna().astype(int)
-                .apply(lambda y: f"{y // 10 * 10}s")
-                .value_counts().sort_index().reset_index()
-            )
-            decade_data.columns = ["Décennie", "Nombre"]
-            st.bar_chart(decade_data.set_index("Décennie"))
+            years = filtered["Année"].dropna()
+            if years.empty:
+                st.caption("Aucune donnée d'année disponible.")
+            else:
+                decade_data = (
+                    years.astype(int)
+                    .apply(lambda y: f"{y // 10 * 10}s")
+                    .value_counts().sort_index().reset_index()
+                )
+                decade_data.columns = ["Décennie", "Nombre"]
+                st.bar_chart(decade_data.set_index("Décennie"))
 
         with c2:
             st.markdown("**Top 15 pays**")
@@ -297,7 +302,9 @@ def render_charts(filtered: pd.DataFrame):
                     c = c.strip()
                     if c and c.lower() != "nan":
                         country_counts[c] = country_counts.get(c, 0) + 1
-            if country_counts:
+            if not country_counts:
+                st.caption("Aucune donnée de pays disponible.")
+            else:
                 top = (
                     pd.Series(country_counts).sort_values(ascending=False)
                     .head(15).reset_index()
@@ -313,26 +320,22 @@ DISPLAY_COLS = [
 ]
 
 
-def render_table(filtered: pd.DataFrame, filters: dict):
+def render_table(filtered: pd.DataFrame):
     cols = [c for c in DISPLAY_COLS if c in filtered.columns]
     display = filtered[cols].copy()
 
-    # Format director names as "Prénom Nom"
     if "Réalisateur(s)" in display.columns:
-        display["Réalisateur(s)"] = display["Réalisateur(s)"].fillna("").astype(str).apply(
-            lambda v: fmt_director(v) if v else ""
+        display["Réalisateur(s)"] = (
+            display["Réalisateur(s)"].fillna("").astype(str)
+            .apply(lambda v: fmt_director(v) if v else "")
         )
 
     for col in ["LTC", "CT", "CNC", "Netgem - Eclair Préservation"]:
         if col in display.columns:
             display[col] = display[col].map({True: "✓", False: ""})
-    display["Année"] = display["Année"].astype("object").where(display["Année"].notna(), other="")
 
-    # Highlight search terms in Titre column
-    if filters["titre"]:
-        display["Titre"] = display["Titre"].fillna("").apply(
-            lambda t: highlight_tokens(t, filters["titre"])
-        )
+    # Année : Int64 → plain int string (avoids "1970.0" in export)
+    display["Année"] = display["Année"].astype(object).where(display["Année"].notna(), other="")
 
     st.dataframe(
         display,
@@ -351,7 +354,8 @@ def render_table(filtered: pd.DataFrame, filters: dict):
         },
     )
 
-    csv = filtered[cols].to_csv(index=False).encode("utf-8")
+    # CSV export : use display (already cleaned) except re-add raw Année for correctness
+    csv = display.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Exporter en CSV", csv, "films_selection.csv", "text/csv")
 
 
@@ -361,12 +365,11 @@ def main():
 
     data = load_data()
     total = len(data)
-    st.caption(f"Source : Inventaire national — liste classée des films | {total:,} films au total")
+    st.caption(f"Source : Inventaire national — liste classée des films  ·  {total:,} films au total")
 
     filters = render_sidebar(data)
     filtered = apply_filters(data, filters)
 
-    # Active filter summary
     summary = active_filter_summary(filters)
     if summary:
         st.info(f"Filtres actifs : {summary}")
@@ -380,7 +383,7 @@ def main():
     if filtered.empty:
         st.warning("Aucun film ne correspond aux critères sélectionnés.")
     else:
-        render_table(filtered, filters)
+        render_table(filtered)
 
 
 if __name__ == "__main__":
